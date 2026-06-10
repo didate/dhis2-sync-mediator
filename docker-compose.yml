@@ -9,8 +9,8 @@ services:
       OPENHIM_TRUST_SELF_SIGNED: "false"
       MEDIATOR_PORT: "8001"
       MEDIATOR_URN: "urn:mediator:dhis2-sync"
-      MEDIATOR_HOST: dhis2-sync-mediator
-      MEDIATOR_SCHEME: http
+      MEDIATOR_HOST: sync.dev.${DOMAIN}
+      MEDIATOR_SCHEME: https
       DHIS2_SOURCE_URL: ${DHIS2_SOURCE_URL}
       DHIS2_SOURCE_PAT: ${DHIS2_SOURCE_PAT}
       DHIS2_TARGET_URL: ${DHIS2_TARGET_URL}
@@ -20,3 +20,12 @@ services:
       MAX_WORKERS: "5"
     networks:
       - internal
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=proxy"
+      - "traefik.http.routers.dhis2-sync.rule=Host(`sync.dev.${DOMAIN}`)"
+      - "traefik.http.routers.dhis2-sync.entrypoints=websecure"
+      - "traefik.http.routers.dhis2-sync.tls=true"
+      - "traefik.http.routers.dhis2-sync.tls.certresolver=letsencrypt"
+      - "traefik.http.services.dhis2-sync.loadbalancer.server.port=8001"
