@@ -3,7 +3,7 @@ services:
     image: ghcr.io/didate/dhis2-sync-mediator:latest
     restart: unless-stopped
     environment:
-      OPENHIM_API_URL: http://openhim-core:8080
+      OPENHIM_API_URL: https://openhim-api.dev.${DOMAIN}
       OPENHIM_API_USER: ${OPENHIM_USER}
       OPENHIM_API_PASSWORD: ${OPENHIM_PASSWORD}
       OPENHIM_TRUST_SELF_SIGNED: "false"
@@ -19,7 +19,6 @@ services:
       DEFAULT_WEEKS: "4"
       MAX_WORKERS: "5"
     networks:
-      - internal
       - proxy
     labels:
       - "traefik.enable=true"
@@ -29,3 +28,7 @@ services:
       - "traefik.http.routers.dhis2-sync.tls=true"
       - "traefik.http.routers.dhis2-sync.tls.certresolver=letsencrypt"
       - "traefik.http.services.dhis2-sync.loadbalancer.server.port=8001"
+
+networks:
+  proxy:
+    external: true
