@@ -18,6 +18,7 @@ services:
       DEFAULT_OU_LEVEL: "6"
       DEFAULT_WEEKS: "4"
       MAX_WORKERS: "5"
+      HAPI_FHIR_URL: https://fhir.dev.${DOMAIN}/fhir
     networks:
       - proxy
     labels:

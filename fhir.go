@@ -5,11 +5,20 @@ import (
 	"strconv"
 	"strings"
 	"time"
+)
 
-	"github.com/google/uuid"
+const (
+	extPeriod    = "https://dhis2.org/fhir/period"
+	extComplete  = "https://dhis2.org/fhir/completeDate"
+	extAttrOptCo = "https://dhis2.org/fhir/attributeOptionCombo"
 )
 
 // FHIR MeasureReport structures (R4)
+
+type FHIRExtension struct {
+	URL         string `json:"url"`
+	ValueString string `json:"valueString,omitempty"`
+}
 
 type MeasureReport struct {
 	ResourceType string              `json:"resourceType"`
@@ -20,6 +29,7 @@ type MeasureReport struct {
 	Subject      *Reference          `json:"subject,omitempty"`
 	Date         string              `json:"date"`
 	Period       FHIRPeriod          `json:"period"`
+	Extension    []FHIRExtension     `json:"extension,omitempty"`
 	Group        []MeasureReportGroup `json:"group,omitempty"`
 }
 
@@ -68,15 +78,23 @@ func DataValueSetToMeasureReport(dvs *DataValueSet, dhis2BaseURL string) (*Measu
 		return nil, fmt.Errorf("parse period %q: %w", dvs.Period, err)
 	}
 
+	// Deterministic ID: dataSet-orgUnit-period for idempotent upserts to HAPI FHIR
+	id := fmt.Sprintf("%s-%s-%s", dvs.DataSet, dvs.OrgUnit, dvs.Period)
+
 	mr := &MeasureReport{
 		ResourceType: "MeasureReport",
-		ID:           uuid.New().String(),
+		ID:           id,
 		Status:       "complete",
 		Type:         "summary",
 		Measure:      dhis2BaseURL + "/api/dataSets/" + dvs.DataSet,
 		Subject:      &Reference{Reference: "Location/" + dvs.OrgUnit},
 		Date:         time.Now().UTC().Format(time.RFC3339),
 		Period:       *period,
+		Extension: []FHIRExtension{
+			{URL: extPeriod, ValueString: dvs.Period},
+			{URL: extComplete, ValueString: dvs.CompleteDate},
+			{URL: extAttrOptCo, ValueString: dvs.AttributeOptionCombo},
+		},
 	}
 
 	for _, dv := range dvs.DataValues {
@@ -208,25 +226,30 @@ func parseDHIS2Period(p string) (*FHIRPeriod, error) {
 }
 
 // MeasureReportToDataValueSet converts a FHIR MeasureReport back to a DHIS2 DataValueSet.
-// It extracts the dataSet, orgUnit, and period from the MeasureReport metadata,
-// and maps each group back to a DataValue.
+// It extracts the dataSet, orgUnit, and period from the MeasureReport metadata and extensions.
 func MeasureReportToDataValueSet(mr *MeasureReport) (*DataValueSet, error) {
-	// Extract dataSet ID from Measure URL (last path segment)
 	dataSetID := lastPathSegment(mr.Measure)
 
-	// Extract orgUnit from Subject reference ("Location/UID")
 	orgUnit := ""
 	if mr.Subject != nil {
 		orgUnit = lastPathSegment(mr.Subject.Reference)
 	}
 
-	// Convert FHIR period back to DHIS2 period is not needed here
-	// since we preserve the original period in the DataValueSet from source.
-	// We'll pass it through from the original DVS.
-
 	dvs := &DataValueSet{
 		DataSet: dataSetID,
 		OrgUnit: orgUnit,
+	}
+
+	// Restore DHIS2 metadata from extensions
+	for _, ext := range mr.Extension {
+		switch ext.URL {
+		case extPeriod:
+			dvs.Period = ext.ValueString
+		case extComplete:
+			dvs.CompleteDate = truncateToDate(ext.ValueString)
+		case extAttrOptCo:
+			dvs.AttributeOptionCombo = ext.ValueString
+		}
 	}
 
 	for _, g := range mr.Group {

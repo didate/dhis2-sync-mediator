@@ -167,3 +167,22 @@ func (c *DHIS2Client) PostDataValueSet(dvs *DataValueSet) ([]byte, string, error
 
 	return respBody, endpoint, nil
 }
+
+type ImportCount struct {
+	Imported int `json:"imported"`
+	Updated  int `json:"updated"`
+	Ignored  int `json:"ignored"`
+	Deleted  int `json:"deleted"`
+}
+
+func parseImportCount(body []byte) *ImportCount {
+	var resp struct {
+		Response struct {
+			ImportCount ImportCount `json:"importCount"`
+		} `json:"response"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return &ImportCount{}
+	}
+	return &resp.Response.ImportCount
+}

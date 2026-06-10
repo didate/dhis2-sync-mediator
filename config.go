@@ -23,6 +23,7 @@ type Config struct {
 	MaxWorkers         int
 	MediatorHost       string
 	MediatorScheme     string
+	HAPIFhirURL        string
 }
 
 func LoadConfig() *Config {
@@ -43,6 +44,7 @@ func LoadConfig() *Config {
 		MaxWorkers:       getEnvDefaultInt("MAX_WORKERS", 5),
 		MediatorHost:     getEnvDefault("MEDIATOR_HOST", "localhost"),
 		MediatorScheme:   getEnvDefault("MEDIATOR_SCHEME", "http"),
+		HAPIFhirURL:     os.Getenv("HAPI_FHIR_URL"),
 	}
 }
 
