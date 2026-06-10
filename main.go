@@ -91,12 +91,25 @@ func handleSync(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Fetched %d dataValues from source in %v",
 		len(dvs.DataValues), endSrc.Sub(startSrc))
 
+	// Step 2: Convert to FHIR MeasureReport
+	measureReport, err := DataValueSetToMeasureReport(dvs, cfg.DHIS2SourceURL)
+	if err != nil {
+		log.Printf("FHIR conversion error: %v", err)
+		respondError(w, http.StatusInternalServerError,
+			fmt.Sprintf("FHIR conversion failed: %v", err))
+		return
+	}
+	endConvert := time.Now()
+
+	fhirBody, _ := json.MarshalIndent(measureReport, "", "  ")
+	log.Printf("Converted to FHIR MeasureReport (%d groups) in %v",
+		len(measureReport.Group), endConvert.Sub(endSrc))
+
 	respBody, _ := json.MarshalIndent(map[string]interface{}{
 		"step":           "2",
-		"action":         "pull-source",
-		"dataSet":        dvs.DataSet,
-		"period":         dvs.Period,
-		"orgUnit":        dvs.OrgUnit,
+		"action":         "convert-to-fhir",
+		"measureReport":  measureReport.ID,
+		"groupCount":     len(measureReport.Group),
 		"dataValueCount": len(dvs.DataValues),
 	}, "", "  ")
 
@@ -107,23 +120,39 @@ func handleSync(w http.ResponseWriter, r *http.Request) {
 			Status:    200,
 			Headers:   map[string]string{"Content-Type": "application/json"},
 			Body:      string(respBody),
-			Timestamp: endSrc,
+			Timestamp: endConvert,
 		},
-		Orchestrations: []Orchestration{{
-			Name: "pull-dhis2-source",
-			Request: OHRequest{
-				Path:      srcEndpoint,
-				Method:    "GET",
-				Headers:   map[string]string{"Authorization": "ApiToken ***"},
-				Timestamp: startSrc,
+		Orchestrations: []Orchestration{
+			{
+				Name: "pull-dhis2-source",
+				Request: OHRequest{
+					Path:      srcEndpoint,
+					Method:    "GET",
+					Headers:   map[string]string{"Authorization": "ApiToken ***"},
+					Timestamp: startSrc,
+				},
+				Response: OHResponse{
+					Status:    200,
+					Headers:   map[string]string{"Content-Type": "application/json"},
+					Body:      string(rawBody),
+					Timestamp: endSrc,
+				},
 			},
-			Response: OHResponse{
-				Status:    200,
-				Headers:   map[string]string{"Content-Type": "application/json"},
-				Body:      string(rawBody),
-				Timestamp: endSrc,
+			{
+				Name: "convert-to-fhir-measurereport",
+				Request: OHRequest{
+					Path:      "internal://fhir-conversion",
+					Method:    "TRANSFORM",
+					Timestamp: endSrc,
+				},
+				Response: OHResponse{
+					Status:    200,
+					Headers:   map[string]string{"Content-Type": "application/fhir+json"},
+					Body:      string(fhirBody),
+					Timestamp: endConvert,
+				},
 			},
-		}},
+		},
 	}
 
 	w.Header().Set("Content-Type", "application/json+openhim")
