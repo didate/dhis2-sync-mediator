@@ -55,5 +55,5 @@ jobs:
           key: ${{ secrets.SERVER_SSH_KEY }}
           script: |
             cd ${{ secrets.COMPOSE_DIR }}
-            docker compose pull dhis2-sync-mediator
-            docker compose up -d dhis2-sync-mediator
+            docker compose -f docker-compose.yml -f ${{ secrets.MEDIATOR_COMPOSE_FILE }} pull dhis2-sync-mediator
+            docker compose -f docker-compose.yml -f ${{ secrets.MEDIATOR_COMPOSE_FILE }} up -d dhis2-sync-mediator
