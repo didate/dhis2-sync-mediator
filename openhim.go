@@ -69,12 +69,12 @@ func (c *OpenHIMClient) Register() error {
 			AllowedRoles: []string{"dhis2-sync"},
 			Routes: []Endpoint{{
 				Name:    "DHIS2 Sync Mediator Route",
-				Host:    "celsa-intervalic-shayna.ngrok-free.dev",
+				Host:    c.cfg.MediatorHost,
 				Port:    mustAtoi(c.cfg.MediatorPort),
 				Path:    "/sync",
 				Primary: true,
-				Type:    "http",
-				Secured: true,
+				Type:    c.cfg.MediatorScheme,
+				Secured: c.cfg.MediatorScheme == "https",
 			}},
 		}},
 		Endpoints: []Endpoint{{

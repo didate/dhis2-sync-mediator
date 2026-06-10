@@ -12,6 +12,15 @@ import (
 )
 
 // DataValueSet : structure JSON retournée par /api/dataValueSets
+type OrgUnit struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+type OrgUnitsResponse struct {
+	OrganisationUnits []OrgUnit `json:"organisationUnits"`
+}
+
 type DataValueSet struct {
 	DataSet              string      `json:"dataSet,omitempty"`
 	CompleteDate         string      `json:"completeDate,omitempty"`
@@ -52,6 +61,39 @@ func NewDHIS2Client(baseURL, pat string) *DHIS2Client {
 			},
 		},
 	}
+}
+
+func (c *DHIS2Client) FetchOrgUnits(level int) ([]OrgUnit, error) {
+	endpoint := fmt.Sprintf("%s/api/organisationUnits?level=%d&paging=false&fields=id,name", c.BaseURL, level)
+
+	req, err := http.NewRequest("GET", endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Authorization", "ApiToken "+c.PAT)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch org units failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read body: %w", err)
+	}
+
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("dhis2 returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result OrgUnitsResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("parse org units: %w", err)
+	}
+
+	return result.OrganisationUnits, nil
 }
 
 func (c *DHIS2Client) FetchDataValueSet(dataSet, orgUnit, period string) (*DataValueSet, []byte, string, error) {

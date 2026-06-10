@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"time"
 )
 
@@ -52,7 +53,9 @@ func main() {
 	ohc.Heartbeat()
 
 	// HTTP server
-	http.HandleFunc("/sync", handleSync)
+	http.HandleFunc("/sync", func(w http.ResponseWriter, r *http.Request) {
+		handleSync(w, r, cfg)
+	})
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
 	})
@@ -62,148 +65,225 @@ func main() {
 	log.Fatal(http.ListenAndServe(addr, nil))
 }
 
-func handleSync(w http.ResponseWriter, r *http.Request) {
-	cfg := LoadConfig()
+func handleSync(w http.ResponseWriter, r *http.Request, cfg *Config) {
 	log.Printf("Received %s %s", r.Method, r.URL.String())
+	startTotal := time.Now()
 
 	dataSet := r.URL.Query().Get("dataSet")
-	orgUnit := r.URL.Query().Get("orgUnit")
-	period := r.URL.Query().Get("period")
-
-	if dataSet == "" || orgUnit == "" || period == "" {
-		respondError(w, http.StatusBadRequest,
-			"Missing required query params: dataSet, orgUnit, period")
+	if dataSet == "" {
+		respondError(w, http.StatusBadRequest, "Missing required query param: dataSet")
 		return
 	}
 
 	src := NewDHIS2Client(cfg.DHIS2SourceURL, cfg.DHIS2SourcePAT)
-	startSrc := time.Now()
-	dvs, rawBody, srcEndpoint, err := src.FetchDataValueSet(dataSet, orgUnit, period)
-	endSrc := time.Now()
-
-	if err != nil {
-		log.Printf("Source fetch error: %v", err)
-		respondError(w, http.StatusBadGateway,
-			fmt.Sprintf("Source fetch failed: %v", err))
-		return
-	}
-
-	log.Printf("Fetched %d dataValues from source in %v",
-		len(dvs.DataValues), endSrc.Sub(startSrc))
-
-	// Step 2: Convert to FHIR MeasureReport
-	measureReport, err := DataValueSetToMeasureReport(dvs, cfg.DHIS2SourceURL)
-	if err != nil {
-		log.Printf("FHIR conversion error: %v", err)
-		respondError(w, http.StatusInternalServerError,
-			fmt.Sprintf("FHIR conversion failed: %v", err))
-		return
-	}
-	endConvert := time.Now()
-
-	fhirBody, _ := json.MarshalIndent(measureReport, "", "  ")
-	log.Printf("Converted to FHIR MeasureReport (%d groups) in %v",
-		len(measureReport.Group), endConvert.Sub(endSrc))
-
-	// Step 3: Convert FHIR MeasureReport back to DataValueSet
-	targetDVS, err := MeasureReportToDataValueSet(measureReport)
-	if err != nil {
-		log.Printf("FHIR to DataValueSet conversion error: %v", err)
-		respondError(w, http.StatusInternalServerError,
-			fmt.Sprintf("FHIR reverse conversion failed: %v", err))
-		return
-	}
-	// Preserve original period from source (FHIR period is date-based, DHIS2 needs the original format)
-	targetDVS.Period = dvs.Period
-	targetDVS.CompleteDate = truncateToDate(dvs.CompleteDate)
-	targetDVS.AttributeOptionCombo = dvs.AttributeOptionCombo
-
-	// Step 4: Push to target DHIS2
 	target := NewDHIS2Client(cfg.DHIS2TargetURL, cfg.DHIS2TargetPAT)
-	startTarget := time.Now()
-	targetRawBody, targetEndpoint, err := target.PostDataValueSet(targetDVS)
-	endTarget := time.Now()
+	orchestrations := []Orchestration{}
 
-	targetBody, _ := json.Marshal(targetDVS)
-	pushStatus := "Successful"
-	pushHTTPStatus := 200
-
-	if err != nil {
-		log.Printf("Target push error: %v", err)
-		pushStatus = "Failed"
-		pushHTTPStatus = 502
+	// --- Determine org units ---
+	var orgUnits []OrgUnit
+	if ouParam := r.URL.Query().Get("orgUnit"); ouParam != "" {
+		orgUnits = []OrgUnit{{ID: ouParam, Name: ouParam}}
 	} else {
-		log.Printf("Pushed %d dataValues to target in %v",
-			len(targetDVS.DataValues), endTarget.Sub(startTarget))
+		ouLevel := cfg.DefaultOULevel
+		if v := r.URL.Query().Get("ouLevel"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				ouLevel = n
+			}
+		}
+
+		startOU := time.Now()
+		var err error
+		orgUnits, err = src.FetchOrgUnits(ouLevel)
+		endOU := time.Now()
+
+		if err != nil {
+			log.Printf("Fetch org units error: %v", err)
+			respondError(w, http.StatusBadGateway,
+				fmt.Sprintf("Failed to fetch org units: %v", err))
+			return
+		}
+
+		orchestrations = append(orchestrations, Orchestration{
+			Name: "fetch-org-units",
+			Request: OHRequest{
+				Path:      fmt.Sprintf("%s/api/organisationUnits?level=%d", cfg.DHIS2SourceURL, ouLevel),
+				Method:    "GET",
+				Headers:   map[string]string{"Authorization": "ApiToken ***"},
+				Timestamp: startOU,
+			},
+			Response: OHResponse{
+				Status:    200,
+				Headers:   map[string]string{"Content-Type": "application/json"},
+				Body:      fmt.Sprintf(`{"count":%d}`, len(orgUnits)),
+				Timestamp: endOU,
+			},
+		})
+		log.Printf("Fetched %d org units at level %d", len(orgUnits), ouLevel)
 	}
 
-	respBody, _ := json.MarshalIndent(map[string]interface{}{
-		"step":           "4",
-		"action":         "push-to-target",
-		"dataValueCount": len(targetDVS.DataValues),
-		"status":         pushStatus,
-	}, "", "  ")
+	// --- Determine periods ---
+	var periods []string
+	if pParam := r.URL.Query().Get("period"); pParam != "" {
+		periods = []string{pParam}
+	} else {
+		weeks := cfg.DefaultWeeks
+		if v := r.URL.Query().Get("weeks"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				weeks = n
+			}
+		}
+		periods = GenerateWeekPeriods(weeks)
+	}
+
+	totalCombinations := len(orgUnits) * len(periods)
+	log.Printf("Starting sync: %d OUs × %d periods = %d combinations",
+		len(orgUnits), len(periods), totalCombinations)
+
+	// --- Step 1: Pull all + FHIR conversion ---
+	startPull := time.Now()
+	pullResults := PullAll(src, dataSet, orgUnits, periods, cfg.DHIS2SourceURL, cfg.MaxWorkers)
+	endPull := time.Now()
+
+	pullSuccess := 0
+	pullFail := 0
+	pullEmpty := 0
+	totalSourceValues := 0
+	for _, r := range pullResults {
+		if r.Error != nil {
+			pullFail++
+		} else if r.TargetDVS == nil || len(r.TargetDVS.DataValues) == 0 {
+			pullEmpty++
+		} else {
+			pullSuccess++
+			totalSourceValues += len(r.SourceDVS.DataValues)
+		}
+	}
+
+	orchestrations = append(orchestrations, Orchestration{
+		Name: "pull-and-convert",
+		Request: OHRequest{
+			Path:      fmt.Sprintf("internal://pull-all?combinations=%d", totalCombinations),
+			Method:    "BATCH",
+			Timestamp: startPull,
+		},
+		Response: OHResponse{
+			Status:  200,
+			Headers: map[string]string{"Content-Type": "application/json"},
+			Body: fmt.Sprintf(`{"success":%d,"failed":%d,"empty":%d,"totalDataValues":%d}`,
+				pullSuccess, pullFail, pullEmpty, totalSourceValues),
+			Timestamp: endPull,
+		},
+	})
+
+	log.Printf("Pull complete: %d success, %d failed, %d empty in %v",
+		pullSuccess, pullFail, pullEmpty, endPull.Sub(startPull))
+
+	// --- Step 2: Push all to target ---
+	startPush := time.Now()
+	pushResults := PushAll(target, pullResults, cfg.MaxWorkers)
+	endPush := time.Now()
+
+	pushSuccess := 0
+	pushFail := 0
+	totalImported := 0
+	totalUpdated := 0
+	totalIgnored := 0
+	var failedDetails []string
+
+	for _, r := range pushResults {
+		if r.Error != nil {
+			pushFail++
+			failedDetails = append(failedDetails,
+				fmt.Sprintf("%s/%s: %v", r.Job.OrgUnit.ID, r.Job.Period, r.Error))
+		} else {
+			pushSuccess++
+			if r.ImportCount != nil {
+				totalImported += r.ImportCount.Imported
+				totalUpdated += r.ImportCount.Updated
+				totalIgnored += r.ImportCount.Ignored
+			}
+		}
+	}
+
+	orchestrations = append(orchestrations, Orchestration{
+		Name: "push-to-target",
+		Request: OHRequest{
+			Path:      fmt.Sprintf("%s/api/dataValueSets", cfg.DHIS2TargetURL),
+			Method:    "BATCH-POST",
+			Timestamp: startPush,
+		},
+		Response: OHResponse{
+			Status:  200,
+			Headers: map[string]string{"Content-Type": "application/json"},
+			Body: fmt.Sprintf(`{"success":%d,"failed":%d,"imported":%d,"updated":%d,"ignored":%d}`,
+				pushSuccess, pushFail, totalImported, totalUpdated, totalIgnored),
+			Timestamp: endPush,
+		},
+	})
+
+	log.Printf("Push complete: %d success, %d failed (imported=%d, updated=%d, ignored=%d) in %v",
+		pushSuccess, pushFail, totalImported, totalUpdated, totalIgnored, endPush.Sub(startPush))
+
+	// --- Build response ---
+	status := "Successful"
+	httpStatus := 200
+	if pushSuccess == 0 && pullSuccess > 0 {
+		status = "Failed"
+		httpStatus = 502
+	} else if pushFail > 0 || pullFail > 0 {
+		status = "Completed"
+	}
+
+	summary := map[string]interface{}{
+		"totalOrgUnits":    len(orgUnits),
+		"totalPeriods":     len(periods),
+		"periods":          periods,
+		"totalCombinations": totalCombinations,
+		"pull": map[string]int{
+			"success": pullSuccess,
+			"failed":  pullFail,
+			"empty":   pullEmpty,
+		},
+		"push": map[string]int{
+			"success":  pushSuccess,
+			"failed":   pushFail,
+			"imported": totalImported,
+			"updated":  totalUpdated,
+			"ignored":  totalIgnored,
+		},
+		"duration": time.Since(startTotal).String(),
+	}
+	if len(failedDetails) > 0 {
+		summary["errors"] = failedDetails
+	}
+
+	respBody, _ := json.MarshalIndent(summary, "", "  ")
 
 	openhimResp := OpenHIMResponse{
 		XMediatorURN: cfg.MediatorURN,
-		Status:       pushStatus,
+		Status:       status,
 		Response: OHResponse{
-			Status:    pushHTTPStatus,
+			Status:    httpStatus,
 			Headers:   map[string]string{"Content-Type": "application/json"},
 			Body:      string(respBody),
-			Timestamp: endTarget,
+			Timestamp: time.Now(),
 		},
-		Orchestrations: []Orchestration{
-			{
-				Name: "pull-dhis2-source",
-				Request: OHRequest{
-					Path:      srcEndpoint,
-					Method:    "GET",
-					Headers:   map[string]string{"Authorization": "ApiToken ***"},
-					Timestamp: startSrc,
-				},
-				Response: OHResponse{
-					Status:    200,
-					Headers:   map[string]string{"Content-Type": "application/json"},
-					Body:      string(rawBody),
-					Timestamp: endSrc,
-				},
-			},
-			{
-				Name: "convert-to-fhir-measurereport",
-				Request: OHRequest{
-					Path:      "internal://fhir-conversion",
-					Method:    "TRANSFORM",
-					Timestamp: endSrc,
-				},
-				Response: OHResponse{
-					Status:    200,
-					Headers:   map[string]string{"Content-Type": "application/fhir+json"},
-					Body:      string(fhirBody),
-					Timestamp: endConvert,
-				},
-			},
-			{
-				Name: "push-dhis2-target",
-				Request: OHRequest{
-					Path:      targetEndpoint,
-					Method:    "POST",
-					Headers:   map[string]string{"Authorization": "ApiToken ***"},
-					Body:      string(targetBody),
-					Timestamp: startTarget,
-				},
-				Response: OHResponse{
-					Status:    pushHTTPStatus,
-					Headers:   map[string]string{"Content-Type": "application/json"},
-					Body:      string(targetRawBody),
-					Timestamp: endTarget,
-				},
-			},
+		Orchestrations: orchestrations,
+		Properties: map[string]string{
+			"pull.success":  strconv.Itoa(pullSuccess),
+			"pull.failed":   strconv.Itoa(pullFail),
+			"push.success":  strconv.Itoa(pushSuccess),
+			"push.failed":   strconv.Itoa(pushFail),
+			"push.imported": strconv.Itoa(totalImported),
+			"push.updated":  strconv.Itoa(totalUpdated),
 		},
 	}
 
 	w.Header().Set("Content-Type", "application/json+openhim")
 	json.NewEncoder(w).Encode(openhimResp)
+
+	log.Printf("Sync completed in %v — pull: %d/%d, push: %d/%d",
+		time.Since(startTotal), pullSuccess, totalCombinations, pushSuccess, pullSuccess)
 }
 
 // truncateToDate takes a DHIS2 date/datetime string and returns just the date part (YYYY-MM-DD).
