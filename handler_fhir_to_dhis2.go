@@ -21,6 +21,24 @@ func handleFHIRToDHIS2(w http.ResponseWriter, r *http.Request, cfg *Config, ohc 
 		return
 	}
 
+	// Determine which periods to push
+	var allowedPeriods map[string]bool
+	if p := r.URL.Query().Get("period"); p != "" {
+		allowedPeriods = map[string]bool{p: true}
+	} else {
+		weeks := cfg.DefaultWeeks
+		if v := r.URL.Query().Get("weeks"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				weeks = n
+			}
+		}
+		periods := GenerateWeekPeriods(weeks)
+		allowedPeriods = make(map[string]bool, len(periods))
+		for _, p := range periods {
+			allowedPeriods[p] = true
+		}
+	}
+
 	respondAccepted(w, cfg.MediatorURN, "FHIR to DHIS2 push started")
 
 	go func() {
@@ -57,7 +75,19 @@ func handleFHIRToDHIS2(w http.ResponseWriter, r *http.Request, cfg *Config, ohc 
 			},
 		})
 
-		log.Printf("Got %d MeasureReports from HAPI FHIR", len(reports))
+		// Filter by allowed periods
+		var filtered []MeasureReport
+		for _, mr := range reports {
+			for _, ext := range mr.Extension {
+				if ext.URL == extPeriod && allowedPeriods[ext.ValueString] {
+					filtered = append(filtered, mr)
+					break
+				}
+			}
+		}
+
+		log.Printf("Got %d MeasureReports from HAPI FHIR, %d match period filter", len(reports), len(filtered))
+		reports = filtered
 
 		if len(reports) == 0 {
 			ohc.UpdateTransaction(transactionID, map[string]interface{}{
