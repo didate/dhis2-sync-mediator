@@ -45,7 +45,7 @@ func handleDHIS2ToFHIR(w http.ResponseWriter, r *http.Request, cfg *Config, ohc 
 
 		// Get org units from HAPI FHIR (Locations)
 		startLoc := time.Now()
-		locations, err := hapi.GetAllLocations(cfg.DHIS2SourceURL + "/api/organisationUnits")
+		locations, err := hapi.GetAllLocations(cfg.OUIdentifierSystem)
 		endLoc := time.Now()
 
 		if err != nil {
