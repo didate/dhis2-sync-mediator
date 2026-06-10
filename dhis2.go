@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -89,4 +90,38 @@ func (c *DHIS2Client) FetchDataValueSet(dataSet, orgUnit, period string) (*DataV
 	}
 
 	return &dvs, body, endpoint, nil
+}
+
+func (c *DHIS2Client) PostDataValueSet(dvs *DataValueSet) ([]byte, string, error) {
+	endpoint := fmt.Sprintf("%s/api/dataValueSets", c.BaseURL)
+
+	body, err := json.Marshal(dvs)
+	if err != nil {
+		return nil, endpoint, fmt.Errorf("marshal dataValueSet: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, endpoint, fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Authorization", "ApiToken "+c.PAT)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, endpoint, fmt.Errorf("dhis2 call failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, endpoint, fmt.Errorf("read body: %w", err)
+	}
+
+	if resp.StatusCode >= 300 {
+		return respBody, endpoint, fmt.Errorf("dhis2 returned %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	return respBody, endpoint, nil
 }

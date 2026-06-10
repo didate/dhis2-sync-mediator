@@ -105,22 +105,53 @@ func handleSync(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Converted to FHIR MeasureReport (%d groups) in %v",
 		len(measureReport.Group), endConvert.Sub(endSrc))
 
+	// Step 3: Convert FHIR MeasureReport back to DataValueSet
+	targetDVS, err := MeasureReportToDataValueSet(measureReport)
+	if err != nil {
+		log.Printf("FHIR to DataValueSet conversion error: %v", err)
+		respondError(w, http.StatusInternalServerError,
+			fmt.Sprintf("FHIR reverse conversion failed: %v", err))
+		return
+	}
+	// Preserve original period from source (FHIR period is date-based, DHIS2 needs the original format)
+	targetDVS.Period = dvs.Period
+	targetDVS.CompleteDate = truncateToDate(dvs.CompleteDate)
+	targetDVS.AttributeOptionCombo = dvs.AttributeOptionCombo
+
+	// Step 4: Push to target DHIS2
+	target := NewDHIS2Client(cfg.DHIS2TargetURL, cfg.DHIS2TargetPAT)
+	startTarget := time.Now()
+	targetRawBody, targetEndpoint, err := target.PostDataValueSet(targetDVS)
+	endTarget := time.Now()
+
+	targetBody, _ := json.Marshal(targetDVS)
+	pushStatus := "Successful"
+	pushHTTPStatus := 200
+
+	if err != nil {
+		log.Printf("Target push error: %v", err)
+		pushStatus = "Failed"
+		pushHTTPStatus = 502
+	} else {
+		log.Printf("Pushed %d dataValues to target in %v",
+			len(targetDVS.DataValues), endTarget.Sub(startTarget))
+	}
+
 	respBody, _ := json.MarshalIndent(map[string]interface{}{
-		"step":           "2",
-		"action":         "convert-to-fhir",
-		"measureReport":  measureReport.ID,
-		"groupCount":     len(measureReport.Group),
-		"dataValueCount": len(dvs.DataValues),
+		"step":           "4",
+		"action":         "push-to-target",
+		"dataValueCount": len(targetDVS.DataValues),
+		"status":         pushStatus,
 	}, "", "  ")
 
 	openhimResp := OpenHIMResponse{
 		XMediatorURN: cfg.MediatorURN,
-		Status:       "Successful",
+		Status:       pushStatus,
 		Response: OHResponse{
-			Status:    200,
+			Status:    pushHTTPStatus,
 			Headers:   map[string]string{"Content-Type": "application/json"},
 			Body:      string(respBody),
-			Timestamp: endConvert,
+			Timestamp: endTarget,
 		},
 		Orchestrations: []Orchestration{
 			{
@@ -152,11 +183,35 @@ func handleSync(w http.ResponseWriter, r *http.Request) {
 					Timestamp: endConvert,
 				},
 			},
+			{
+				Name: "push-dhis2-target",
+				Request: OHRequest{
+					Path:      targetEndpoint,
+					Method:    "POST",
+					Headers:   map[string]string{"Authorization": "ApiToken ***"},
+					Body:      string(targetBody),
+					Timestamp: startTarget,
+				},
+				Response: OHResponse{
+					Status:    pushHTTPStatus,
+					Headers:   map[string]string{"Content-Type": "application/json"},
+					Body:      string(targetRawBody),
+					Timestamp: endTarget,
+				},
+			},
 		},
 	}
 
 	w.Header().Set("Content-Type", "application/json+openhim")
 	json.NewEncoder(w).Encode(openhimResp)
+}
+
+// truncateToDate takes a DHIS2 date/datetime string and returns just the date part (YYYY-MM-DD).
+func truncateToDate(s string) string {
+	if len(s) >= 10 {
+		return s[:10]
+	}
+	return s
 }
 
 func respondError(w http.ResponseWriter, status int, message string) {

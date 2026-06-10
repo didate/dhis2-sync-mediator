@@ -207,6 +207,62 @@ func parseDHIS2Period(p string) (*FHIRPeriod, error) {
 	return nil, fmt.Errorf("unsupported period format: %s", p)
 }
 
+// MeasureReportToDataValueSet converts a FHIR MeasureReport back to a DHIS2 DataValueSet.
+// It extracts the dataSet, orgUnit, and period from the MeasureReport metadata,
+// and maps each group back to a DataValue.
+func MeasureReportToDataValueSet(mr *MeasureReport) (*DataValueSet, error) {
+	// Extract dataSet ID from Measure URL (last path segment)
+	dataSetID := lastPathSegment(mr.Measure)
+
+	// Extract orgUnit from Subject reference ("Location/UID")
+	orgUnit := ""
+	if mr.Subject != nil {
+		orgUnit = lastPathSegment(mr.Subject.Reference)
+	}
+
+	// Convert FHIR period back to DHIS2 period is not needed here
+	// since we preserve the original period in the DataValueSet from source.
+	// We'll pass it through from the original DVS.
+
+	dvs := &DataValueSet{
+		DataSet: dataSetID,
+		OrgUnit: orgUnit,
+	}
+
+	for _, g := range mr.Group {
+		dv := DataValue{}
+
+		// dataElement from group.code
+		if g.Code != nil && len(g.Code.Coding) > 0 {
+			dv.DataElement = g.Code.Coding[0].Code
+		}
+
+		// categoryOptionCombo + value from population
+		if len(g.Population) > 0 {
+			pop := g.Population[0]
+			if pop.Code != nil && len(pop.Code.Coding) > 0 {
+				dv.CategoryOptionCombo = pop.Code.Coding[0].Code
+			}
+			if pop.Count != nil {
+				dv.Value = strconv.Itoa(*pop.Count)
+			}
+		} else if g.MeasureScore != nil {
+			dv.Value = strconv.FormatFloat(g.MeasureScore.Value, 'f', -1, 64)
+		}
+
+		if dv.DataElement != "" && dv.Value != "" {
+			dvs.DataValues = append(dvs.DataValues, dv)
+		}
+	}
+
+	return dvs, nil
+}
+
+func lastPathSegment(s string) string {
+	parts := strings.Split(s, "/")
+	return parts[len(parts)-1]
+}
+
 // weekStart returns the Monday of ISO week for the given year and week number.
 func weekStart(year, week int) time.Time {
 	// Jan 4 is always in ISO week 1
