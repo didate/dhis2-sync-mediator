@@ -1,6 +1,6 @@
 services:
   dhis2-sync-mediator:
-    build: .
+    image: ghcr.io/didate/dhis2-sync-mediator:latest
     restart: unless-stopped
     environment:
       OPENHIM_API_URL: http://openhim-core:8080
