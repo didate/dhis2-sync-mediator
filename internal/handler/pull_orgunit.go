@@ -35,42 +35,12 @@ func HandlePullOrgUnit(w http.ResponseWriter, r *http.Request, cfg *config.Confi
 		hapi := fhir.NewHAPIClient(cfg.HAPIFhirURL)
 		var orchestrations []openhim.Orchestration
 
-		// Fetch org units from DHIS2
-		startFetch := time.Now()
-		orgUnits, err := src.FetchOrgUnits(ouLevel)
-		endFetch := time.Now()
-
-		if err != nil {
-			log.Printf("Fetch org units error: %v", err)
-			ohc.UpdateTransactionFailed(transactionID, cfg.MediatorURN,
-				fmt.Sprintf("Failed to fetch org units: %v", err))
-			return
-		}
-
-		orchestrations = append(orchestrations, openhim.Orchestration{
-			Name: "fetch-org-units-from-dhis2",
-			Request: openhim.OHRequest{
-				Path:      fmt.Sprintf("%s/api/organisationUnits?level=%d", cfg.DHIS2SourceURL, ouLevel),
-				Method:    "GET",
-				Headers:   map[string]string{"Authorization": "ApiToken ***"},
-				Timestamp: startFetch,
-			},
-			Response: openhim.OHResponse{
-				Status:    200,
-				Headers:   map[string]string{"Content-Type": "application/json"},
-				Body:      fmt.Sprintf(`{"count":%d}`, len(orgUnits)),
-				Timestamp: endFetch,
-			},
-		})
-
-		log.Printf("Fetched %d org units at level %d", len(orgUnits), ouLevel)
-
-		// Save as FHIR Locations to HAPI
-		startSave := time.Now()
+		// Save workers start first so each DHIS2 page is written to HAPI while the next one is fetched
 		success := 0
 		failed := 0
+		total := 0
 
-		jobs := make(chan dhis2.OrgUnit, len(orgUnits))
+		jobs := make(chan dhis2.OrgUnit, dhis2.OrgUnitPageSize)
 		var mu sync.Mutex
 		var wg sync.WaitGroup
 
@@ -94,45 +64,83 @@ func HandlePullOrgUnit(w http.ResponseWriter, r *http.Request, cfg *config.Confi
 			}()
 		}
 
-		for _, ou := range orgUnits {
-			jobs <- ou
-		}
+		// Fetch org units from DHIS2, page by page
+		startFetch := time.Now()
+		pages, fetchErr := src.FetchOrgUnits(ouLevel, func(page []dhis2.OrgUnit) error {
+			total += len(page)
+			for _, ou := range page {
+				jobs <- ou
+			}
+			return nil
+		})
+		endFetch := time.Now()
 		close(jobs)
 		wg.Wait()
 		endSave := time.Now()
+
+		fetchStatus := 200
+		fetchBody := fmt.Sprintf(`{"count":%d,"pages":%d}`, total, pages)
+		if fetchErr != nil {
+			log.Printf("Fetch org units error after %d page(s): %v", pages, fetchErr)
+			fetchStatus = 502
+			fetchBody = fmt.Sprintf(`{"count":%d,"pages":%d,"error":%q}`, total, pages, fetchErr.Error())
+		}
+
+		orchestrations = append(orchestrations, openhim.Orchestration{
+			Name: "fetch-org-units-from-dhis2",
+			Request: openhim.OHRequest{
+				Path:      fmt.Sprintf("%s/api/organisationUnits?level=%d&pageSize=%d", cfg.DHIS2SourceURL, ouLevel, dhis2.OrgUnitPageSize),
+				Method:    "GET",
+				Headers:   map[string]string{"Authorization": "ApiToken ***"},
+				Timestamp: startFetch,
+			},
+			Response: openhim.OHResponse{
+				Status:    fetchStatus,
+				Headers:   map[string]string{"Content-Type": "application/json"},
+				Body:      fetchBody,
+				Timestamp: endFetch,
+			},
+		})
+
+		log.Printf("Fetched %d org units at level %d in %d page(s)", total, ouLevel, pages)
 
 		orchestrations = append(orchestrations, openhim.Orchestration{
 			Name: "save-locations-to-hapi-fhir",
 			Request: openhim.OHRequest{
 				Path:      fmt.Sprintf("%s/Location", cfg.HAPIFhirURL),
 				Method:    "PUT",
-				Timestamp: startSave,
+				Timestamp: startFetch,
 			},
 			Response: openhim.OHResponse{
 				Status:    200,
 				Headers:   map[string]string{"Content-Type": "application/json"},
-				Body:      fmt.Sprintf(`{"success":%d,"failed":%d,"total":%d}`, success, failed, len(orgUnits)),
+				Body:      fmt.Sprintf(`{"success":%d,"failed":%d,"total":%d}`, success, failed, total),
 				Timestamp: endSave,
 			},
 		})
 
-		log.Printf("Saved Locations to HAPI: %d success, %d failed in %v", success, failed, endSave.Sub(startSave))
+		log.Printf("Saved Locations to HAPI: %d success, %d failed in %v", success, failed, endSave.Sub(startFetch))
 
 		// Update OpenHIM transaction
 		status := "Successful"
-		if failed > 0 && success > 0 {
-			status = "Completed"
-		} else if success == 0 {
+		if success == 0 {
 			status = "Failed"
+		} else if failed > 0 || fetchErr != nil {
+			status = "Completed"
 		}
 
-		summary, _ := json.MarshalIndent(map[string]interface{}{
-			"orgUnitsFound": len(orgUnits),
+		summaryMap := map[string]interface{}{
+			"orgUnitsFound": total,
+			"pages":         pages,
 			"saved":         success,
 			"failed":        failed,
 			"ouLevel":       ouLevel,
 			"duration":      time.Since(startTotal).String(),
-		}, "", "  ")
+		}
+		if fetchErr != nil {
+			summaryMap["fetchError"] = fetchErr.Error()
+		}
+		summary, _ := json.MarshalIndent(summaryMap, "", "  ")
 
 		ohc.UpdateTransaction(transactionID, map[string]interface{}{
 			"status": status,
@@ -144,7 +152,7 @@ func HandlePullOrgUnit(w http.ResponseWriter, r *http.Request, cfg *config.Confi
 			},
 			"orchestrations": orchestrations,
 			"properties": map[string]string{
-				"orgUnits.total": strconv.Itoa(len(orgUnits)),
+				"orgUnits.total": strconv.Itoa(total),
 				"orgUnits.saved": strconv.Itoa(success),
 			},
 		})

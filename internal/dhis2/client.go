@@ -2,10 +2,10 @@ package dhis2
 
 import (
 	"bytes"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"time"
@@ -18,31 +18,92 @@ type DHIS2Client struct {
 }
 
 func NewDHIS2Client(baseURL, pat string) *DHIS2Client {
+	host := ""
+	if u, err := url.Parse(baseURL); err == nil {
+		host = u.Host
+	}
 	return &DHIS2Client{
 		BaseURL: baseURL,
 		PAT:     pat,
 		http: &http.Client{
 			Timeout: 60 * time.Second,
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: false},
+			Transport: &authTransport{
+				pat:  pat,
+				host: host,
+				base: http.DefaultTransport,
 			},
 		},
 	}
 }
 
-func (c *DHIS2Client) FetchOrgUnits(level int) ([]OrgUnit, error) {
-	endpoint := fmt.Sprintf("%s/api/organisationUnits?level=%d&paging=false&fields=id,name", c.BaseURL, level)
+// authTransport adds the DHIS2 PAT and a JSON Accept header to every request
+// sent to the DHIS2 host. Other hosts (e.g. after a redirect) never get the token.
+type authTransport struct {
+	pat  string
+	host string
+	base http.RoundTripper
+}
 
-	req, err := http.NewRequest("GET", endpoint, nil)
-	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
+func (t *authTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// A RoundTripper must not modify the caller's request
+	req = req.Clone(req.Context())
+	if req.URL.Host == t.host {
+		req.Header.Set("Authorization", "ApiToken "+t.pat)
 	}
-	req.Header.Set("Authorization", "ApiToken "+c.PAT)
-	req.Header.Set("Accept", "application/json")
+	if req.Header.Get("Accept") == "" {
+		req.Header.Set("Accept", "application/json")
+	}
+	return t.base.RoundTrip(req)
+}
 
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("fetch org units failed: %w", err)
+// OrgUnitPageSize is the number of org units requested per DHIS2 page.
+const OrgUnitPageSize = 1000
+
+// FetchOrgUnits pages through org units at the given level and calls fn with
+// each page. It stops at the first error from DHIS2 or from fn.
+// Returns the number of pages fetched.
+func (c *DHIS2Client) FetchOrgUnits(level int, fn func([]OrgUnit) error) (int, error) {
+	for page := 1; ; page++ {
+		// order=id:asc keeps paging stable if org units change during the run
+		endpoint := fmt.Sprintf("%s/api/organisationUnits?level=%d&fields=id,name&order=id:asc&page=%d&pageSize=%d",
+			c.BaseURL, level, page, OrgUnitPageSize)
+
+		result, err := c.fetchOrgUnitPage(endpoint)
+		if err != nil {
+			return page - 1, fmt.Errorf("page %d: %w", page, err)
+		}
+
+		if len(result.OrganisationUnits) > 0 {
+			if err := fn(result.OrganisationUnits); err != nil {
+				return page, err
+			}
+		}
+
+		if page >= result.Pager.PageCount || len(result.OrganisationUnits) == 0 {
+			return page, nil
+		}
+	}
+}
+
+// fetchOrgUnitPage GETs one page of org units, retrying up to 3 times on connection errors.
+func (c *DHIS2Client) fetchOrgUnitPage(endpoint string) (*OrgUnitsResponse, error) {
+	var resp *http.Response
+	for attempt := 0; attempt < 3; attempt++ {
+		req, err := http.NewRequest("GET", endpoint, nil)
+		if err != nil {
+			return nil, fmt.Errorf("build request: %w", err)
+		}
+
+		resp, err = c.http.Do(req)
+		if err == nil {
+			break
+		}
+		if attempt < 2 {
+			log.Printf("DHIS2 GET retry %d/3: %v", attempt+1, err)
+			time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
+			continue
+		}
+		return nil, fmt.Errorf("fetch org units failed after 3 attempts: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -59,8 +120,7 @@ func (c *DHIS2Client) FetchOrgUnits(level int) ([]OrgUnit, error) {
 	if err := json.Unmarshal(body, &result); err != nil {
 		return nil, fmt.Errorf("parse org units: %w", err)
 	}
-
-	return result.OrganisationUnits, nil
+	return &result, nil
 }
 
 func (c *DHIS2Client) FetchDataValueSet(dataSet, orgUnit, period string) (*DataValueSet, []byte, string, error) {
@@ -75,8 +135,6 @@ func (c *DHIS2Client) FetchDataValueSet(dataSet, orgUnit, period string) (*DataV
 	if err != nil {
 		return nil, nil, endpoint, fmt.Errorf("build request: %w", err)
 	}
-	req.Header.Set("Authorization", "ApiToken "+c.PAT)
-	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -113,9 +171,7 @@ func (c *DHIS2Client) PostDataValueSet(dvs *DataValueSet) ([]byte, string, error
 	if err != nil {
 		return nil, endpoint, fmt.Errorf("build request: %w", err)
 	}
-	req.Header.Set("Authorization", "ApiToken "+c.PAT)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.http.Do(req)
 	if err != nil {

@@ -8,6 +8,11 @@ type OrgUnit struct {
 }
 
 type OrgUnitsResponse struct {
+	Pager struct {
+		Page      int `json:"page"`
+		PageCount int `json:"pageCount"`
+		Total     int `json:"total"`
+	} `json:"pager"`
 	OrganisationUnits []OrgUnit `json:"organisationUnits"`
 }
 
